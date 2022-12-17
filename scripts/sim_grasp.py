@@ -1,49 +1,64 @@
 import argparse
+import numpy as np
 from pathlib import Path
+from tqdm import tqdm
 
-from vgn.detection import VGN
-from vgn.experiments import clutter_removal
+from robot_helpers.io import load_yaml
+from vgn.detection import VGN, select_local_maxima
+from vgn.envs import ClutterRemovalEnv
+import vgn.visualizer as vis
 
 
-def main(args):
+def main():
+    parser = create_parser()
+    args = parser.parse_args()
+    cfg = load_yaml(args.cfg)
+    rng = np.random.RandomState(args.seed)
+    env = ClutterRemovalEnv(cfg, rng)
+    vgn = VGN(args.model)
 
-    if args.rviz or str(args.model) == "gpd":
-        import rospy
+    grasp_count = 0
+    cleared_count = 0
+    object_count = 0
 
-        rospy.init_node("sim_grasp", anonymous=True)
+    def compute_grasp(voxel_size, tsdf_grid):
+        out = vgn.predict(tsdf_grid)
+        grasps, qualities = select_local_maxima(voxel_size, out, threshold=0.9)
+        # vis.grasps(grasps, qualities)
+        return grasps[np.argmax(qualities)] if len(grasps) > 0 else None
 
-    if str(args.model) == "gpd":
-        from vgn.baselines import GPD
+    for _ in tqdm(range(args.episode_count)):
+        info = env.reset()
+        object_count += info["object_count"]
+        done = False
+        while not done:
+            voxel_size, tsdf_grid = env.get_observation()
+            grasp = compute_grasp(voxel_size, tsdf_grid)
+            # vis.show()
+            if grasp:
+                success, done = env.step(grasp)
+                grasp_count += 1
+                cleared_count += success
+            else:
+                break
 
-        grasp_planner = GPD()
-    else:
-        grasp_planner = VGN(args.model, rviz=args.rviz)
-
-    clutter_removal.run(
-        grasp_plan_fn=grasp_planner,
-        logdir=args.logdir,
-        description=args.description,
-        scene=args.scene,
-        object_set=args.object_set,
-        num_objects=args.num_objects,
-        num_rounds=args.num_rounds,
-        seed=args.seed,
-        sim_gui=args.sim_gui,
-        rviz=args.rviz,
+    print(
+        "Grasp count: {}, success rate: {:.2f}, percent cleared: {:.2f}".format(
+            grasp_count,
+            (cleared_count / grasp_count) * 100,
+            (cleared_count / object_count) * 100,
+        )
     )
 
 
-if __name__ == "__main__":
+def create_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--logdir", type=Path, default="data/experiments")
-    parser.add_argument("--description", type=str, default="")
-    parser.add_argument("--scene", type=str, choices=["pile", "packed"], default="pile")
-    parser.add_argument("--object-set", type=str, default="blocks")
-    parser.add_argument("--num-objects", type=int, default=5)
-    parser.add_argument("--num-rounds", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--sim-gui", action="store_true")
-    parser.add_argument("--rviz", action="store_true")
-    args = parser.parse_args()
-    main(args)
+    parser.add_argument("--model", type=Path, default="assets/models/vgn_conv.pth")
+    parser.add_argument("--cfg", type=Path, default="cfg/sim/blocks.yaml")
+    parser.add_argument("--episode-count", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=1)
+    return parser
+
+
+if __name__ == "__main__":
+    main()

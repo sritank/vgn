@@ -1,161 +1,135 @@
 import argparse
 from pathlib import Path
-
 from mpi4py import MPI
 import numpy as np
 import open3d as o3d
-import scipy.signal as signal
 from tqdm import tqdm
 
-from vgn.grasp import Grasp, Label
-from vgn.io import *
-from vgn.perception import *
-from vgn.simulation import ClutterRemovalSim
-from vgn.utils.transform import Rotation, Transform
+from robot_helpers.io import load_yaml
+from robot_helpers.spatial import Rotation, Transform
+from vgn.data import write
+from vgn.grasp import ParallelJawGrasp
+from vgn.perception import create_tsdf
+from vgn.simulation import GraspSim, get_metric, generate_pile
+from vgn.utils import find_urdfs, view_on_sphere
 
 
-OBJECT_COUNT_LAMBDA = 4
-MAX_VIEWPOINT_COUNT = 6
-GRASPS_PER_SCENE = 120
+def main():
+    worker_count, rank = setup_mpi()
 
+    parser = create_parser()
+    args = parser.parse_args()
 
-def main(args):
-    workers, rank = setup_mpi()
-    sim = ClutterRemovalSim(args.scene, args.object_set, gui=args.sim_gui)
-    finger_depth = sim.gripper.finger_depth
-    grasps_per_worker = args.num_grasps // workers
-    pbar = tqdm(total=grasps_per_worker, disable=rank != 0)
+    args.root.mkdir(parents=True, exist_ok=True)
+    rng = np.random.RandomState(args.seed + 100 * rank)
+    cfg = load_yaml(args.cfg)
+    object_urdfs = find_urdfs(Path(cfg["object_urdfs"]))
 
-    if rank == 0:
-        (args.root / "scenes").mkdir(parents=True, exist_ok=True)
-        write_setup(
-            args.root,
-            sim.size,
-            sim.camera.intrinsic,
-            sim.gripper.max_opening_width,
-            sim.gripper.finger_depth,
-        )
+    origin = Transform.t_[0.0, 0.0, 0.05]
+    size = 0.3
+    center = origin * Transform.t_[0.5 * size, 0.5 * size, 0.0]
 
-    for _ in range(grasps_per_worker // GRASPS_PER_SCENE):
-        # generate heap
-        object_count = np.random.poisson(OBJECT_COUNT_LAMBDA) + 1
-        sim.reset(object_count)
-        sim.save_state()
+    sim = GraspSim(cfg["sim"], rng)
+    score_fn = get_metric(cfg["metric"])(sim)
 
-        # render synthetic depth images
-        n = np.random.randint(MAX_VIEWPOINT_COUNT) + 1
-        depth_imgs, extrinsics = render_images(sim, n)
+    grasp_count = args.count // worker_count
+    scene_count = grasp_count // cfg["scene_grasp_count"]
 
-        # reconstrct point cloud using a subset of the images
-        tsdf = create_tsdf(sim.size, 120, depth_imgs, sim.camera.intrinsic, extrinsics)
-        pc = tsdf.get_cloud()
+    for _ in tqdm(range(scene_count), disable=rank != 0):
+        object_count = rng.poisson(cfg["object_count_lambda"]) + 1
+        urdfs = rng.choice(object_urdfs, object_count)
+        scales = rng.uniform(cfg["scaling"]["low"], cfg["scaling"]["high"], len(urdfs))
+        sim.clear()
+        sim.robot.reset(Transform.t_[np.full(3, 10)], sim.robot.max_width)
+        generate_pile(sim, origin, size, urdfs, scales)
+        state_id = sim.save_state()
 
-        # crop surface and borders from point cloud
-        bounding_box = o3d.geometry.AxisAlignedBoundingBox(sim.lower, sim.upper)
-        pc = pc.crop(bounding_box)
-        # o3d.visualization.draw_geometries([pc])
-
+        view_count = rng.randint(cfg["max_view_count"]) + 1
+        views = sample_views(center, size, view_count, rng)
+        imgs = render_imgs(views, sim.camera)
+        pc = create_pc(center, size, imgs, sim.camera.intrinsic, views)
         if pc.is_empty():
-            print("Point cloud empty, skipping scene")
             continue
 
-        # store the raw data
-        scene_id = write_sensor_data(args.root, depth_imgs, extrinsics)
+        grasps = sample_grasps(cfg["scene_grasp_count"], pc, sim.robot, rng)
+        scores = [evaluate_grasp_point(g, sim, state_id, score_fn) for g in grasps]
 
-        for _ in range(GRASPS_PER_SCENE):
-            # sample and evaluate a grasp point
-            point, normal = sample_grasp_point(pc, finger_depth)
-            grasp, label = evaluate_grasp_point(sim, point, normal)
+        write(views, imgs, grasps, scores, args.root)
 
-            # store the sample
-            write_grasp(args.root, scene_id, grasp, label)
-            pbar.update()
 
-    pbar.close()
+def create_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--cfg", type=Path, required=True)
+    parser.add_argument("--count", type=int, default=1000000)
+    parser.add_argument("--seed", type=int, default=1)
+    return parser
 
 
 def setup_mpi():
-    workers = MPI.COMM_WORLD.Get_size()
+    worker_count = MPI.COMM_WORLD.Get_size()
     rank = MPI.COMM_WORLD.Get_rank()
-    return workers, rank
+    return worker_count, rank
 
 
-def render_images(sim, n):
-    height, width = sim.camera.intrinsic.height, sim.camera.intrinsic.width
-    origin = Transform(Rotation.identity(), np.r_[sim.size / 2, sim.size / 2, 0.0])
-
-    extrinsics = np.empty((n, 7), np.float32)
-    depth_imgs = np.empty((n, height, width), np.float32)
-
-    for i in range(n):
-        r = np.random.uniform(1.6, 2.4) * sim.size
-        theta = np.random.uniform(0.0, np.pi / 4.0)
-        phi = np.random.uniform(0.0, 2.0 * np.pi)
-
-        extrinsic = camera_on_sphere(origin, r, theta, phi)
-        depth_img = sim.camera.render(extrinsic)[1]
-
-        extrinsics[i] = extrinsic.to_list()
-        depth_imgs[i] = depth_img
-
-    return depth_imgs, extrinsics
+def sample_views(center, size, view_count, rng):
+    views = []
+    for _ in range(view_count):
+        r = rng.uniform(1.6, 2.4) * size
+        theta = rng.uniform(np.pi / 4.0)
+        phi = rng.uniform(2.0 * np.pi)
+        views.append(view_on_sphere(center, r, theta, phi))
+    return views
 
 
-def sample_grasp_point(point_cloud, finger_depth, eps=0.1):
-    points = np.asarray(point_cloud.points)
-    normals = np.asarray(point_cloud.normals)
-    ok = False
-    while not ok:
-        # TODO this could result in an infinite loop, though very unlikely
-        idx = np.random.randint(len(points))
-        point, normal = points[idx], normals[idx]
-        ok = normal[2] > -0.1  # make sure the normal is poitning upwards
-    grasp_depth = np.random.uniform(-eps * finger_depth, (1.0 + eps) * finger_depth)
-    point = point + normal * grasp_depth
-    return point, normal
+def render_imgs(views, camera):
+    return [camera.get_image(view)[1] for view in views]
 
 
-def evaluate_grasp_point(sim, pos, normal, num_rotations=6):
-    # define initial grasp frame on object surface
-    z_axis = -normal
-    x_axis = np.r_[1.0, 0.0, 0.0]
-    if np.isclose(np.abs(np.dot(x_axis, z_axis)), 1.0, 1e-4):
-        x_axis = np.r_[0.0, 1.0, 0.0]
-    y_axis = np.cross(z_axis, x_axis)
-    x_axis = np.cross(y_axis, z_axis)
-    R = Rotation.from_matrix(np.vstack((x_axis, y_axis, z_axis)).T)
+def create_pc(center, size, imgs, intrinsic, views):
+    tsdf = create_tsdf(size, 120, imgs, intrinsic, views)
+    pc = tsdf.get_scene_cloud()
+    lower = np.r_[0.02, 0.02, center.translation[2] + 0.01]
+    upper = np.r_[size - 0.02, size - 0.02, size]
+    bounding_box = o3d.geometry.AxisAlignedBoundingBox(lower, upper)
+    return pc.crop(bounding_box)
 
-    # try to grasp with different yaw angles
-    yaws = np.linspace(0.0, np.pi, num_rotations)
-    outcomes, widths = [], []
-    for yaw in yaws:
-        ori = R * Rotation.from_euler("z", yaw)
-        sim.restore_state()
-        candidate = Grasp(Transform(ori, pos), width=sim.gripper.max_opening_width)
-        outcome, width = sim.execute_grasp(candidate, remove=False)
-        outcomes.append(outcome)
-        widths.append(width)
 
-    # detect mid-point of widest peak of successful yaw angles
-    # TODO currently this does not properly handle periodicity
-    successes = (np.asarray(outcomes) == Label.SUCCESS).astype(float)
-    if np.sum(successes):
-        peaks, properties = signal.find_peaks(
-            x=np.r_[0, successes, 0], height=1, width=1
-        )
-        idx_of_widest_peak = peaks[np.argmax(properties["widths"])] - 1
-        ori = R * Rotation.from_euler("z", yaws[idx_of_widest_peak])
-        width = widths[idx_of_widest_peak]
+def sample_grasps(count, pc, robot, rng, eps=0.1):
+    points, normals = np.asarray(pc.points), np.asarray(pc.normals)
+    grasps = []
+    for _ in range(count):
+        ok = False
+        while not ok:  # This could result in an infinite loop, though unlikely.
+            i = rng.randint(len(points))
+            point, normal = points[i], normals[i]
+            ok = normal[2] > -0.1  # Ensure that the normal is pointing upwards
+        depth = rng.uniform(-eps * robot.max_depth, (1 + eps) * robot.max_depth)
+        pose = construct_grasp_frame(point, normal) * Transform.t_[0, 0, -depth]
+        grasps.append(ParallelJawGrasp(pose, robot.max_width))
+    return grasps
 
-    return Grasp(Transform(ori, pos), width), int(np.max(outcomes))
+
+def construct_grasp_frame(point, normal):
+    z = -normal
+    y = np.r_[z[1] - z[2], -z[0] + z[2], z[0] - z[1]]
+    y /= np.linalg.norm(y)
+    x = np.cross(y, z)
+    return Transform(Rotation.from_matrix(np.vstack((x, y, z))), point)
+
+
+def evaluate_grasp_point(grasp, sim, state_id, quality_fn, rot_count=6):
+    # Changes the rotation of the grasp in place
+    angles = np.linspace(0.0, np.pi, rot_count)
+    R = grasp.pose.rotation
+    for angle in angles:
+        grasp.pose.rotation = R * Rotation.from_rotvec([0, 0, angle])
+        sim.restore_state(state_id)
+        quality, _ = quality_fn(grasp)
+        if quality:
+            return 1.0
+    return 0.0
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("root", type=Path)
-    parser.add_argument("--scene", type=str, choices=["pile", "packed"], default="pile")
-    parser.add_argument("--object-set", type=str, default="blocks")
-    parser.add_argument("--num-grasps", type=int, default=10000)
-    parser.add_argument("--sim-gui", action="store_true")
-    args = parser.parse_args()
-    main(args)
+    main()

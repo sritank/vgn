@@ -1,14 +1,15 @@
-catkin_pkg
 black
-jupyterlab
-numpy
-scipy
-pandas
-matplotlib
+catkin_pkg
+# mayavi
 mpi4py
+numpy
 open3d
-pybullet==2.7.9
-torch
+pandas
+pybullet
 pytorch-ignite
+pyyaml
+scikit-image
+scipy
 tensorboard
+torch
 tqdm

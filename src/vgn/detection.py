@@ -1,114 +1,100 @@
-import time
+from dataclasses import dataclass
 
 import numpy as np
 from scipy import ndimage
 import torch
 
-from vgn import vis
-from vgn.grasp import *
-from vgn.utils.transform import Transform, Rotation
+from robot_helpers.spatial import Rotation, Transform
+from vgn.grasp import ParallelJawGrasp
 from vgn.networks import load_network
 
 
-class VGN(object):
-    def __init__(self, model_path, rviz=False):
+@dataclass
+class Output:
+    qual: np.ndarray
+    rot: np.ndarray
+    width: np.ndarray
+
+
+class VGN:
+    def __init__(self, model_path):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.net = load_network(model_path, self.device)
-        self.rviz = rviz
 
-    def __call__(self, state):
-        tsdf_vol = state.tsdf.get_grid()
-        voxel_size = state.tsdf.voxel_size
+    def predict(self, tsdf, sigma=1.0):
+        assert tsdf.shape == (40, 40, 40)
+        tsdf_in = torch.from_numpy(tsdf)[None, None, :].to(self.device)
+        with torch.no_grad():
+            qual, rot, width = self.net(tsdf_in)
+        qual = qual.cpu().squeeze().numpy()
+        rot = rot.cpu().squeeze().numpy()
+        width = width.cpu().squeeze().numpy()
 
-        tic = time.time()
-        qual_vol, rot_vol, width_vol = predict(tsdf_vol, self.net, self.device)
-        qual_vol, rot_vol, width_vol = process(tsdf_vol, qual_vol, rot_vol, width_vol)
-        grasps, scores = select(qual_vol.copy(), rot_vol, width_vol)
-        toc = time.time() - tic
+        # Smooth quality volume with a Gaussian
+        qual = ndimage.gaussian_filter(qual, sigma, mode="nearest")
 
-        grasps, scores = np.asarray(grasps), np.asarray(scores)
+        # Mask out voxels too far away from the surface
+        outside_voxels = tsdf > 0.5
+        inside_voxels = np.logical_and(1e-3 < tsdf, tsdf < 0.5)
+        valid_voxels = ndimage.morphology.binary_dilation(
+            outside_voxels, iterations=2, mask=np.logical_not(inside_voxels)
+        )
+        qual[valid_voxels == False] = 0.0
 
-        if len(grasps) > 0:
-            p = np.random.permutation(len(grasps))
-            grasps = [from_voxel_coordinates(g, voxel_size) for g in grasps[p]]
-            scores = scores[p]
-
-        if self.rviz:
-            vis.draw_quality(qual_vol, state.tsdf.voxel_size, threshold=0.01)
-
-        return grasps, scores, toc
-
-
-def predict(tsdf_vol, net, device):
-    assert tsdf_vol.shape == (1, 40, 40, 40)
-
-    # move input to the GPU
-    tsdf_vol = torch.from_numpy(tsdf_vol).unsqueeze(0).to(device)
-
-    # forward pass
-    with torch.no_grad():
-        qual_vol, rot_vol, width_vol = net(tsdf_vol)
-
-    # move output back to the CPU
-    qual_vol = qual_vol.cpu().squeeze().numpy()
-    rot_vol = rot_vol.cpu().squeeze().numpy()
-    width_vol = width_vol.cpu().squeeze().numpy()
-    return qual_vol, rot_vol, width_vol
+        return Output(qual, rot, width)
 
 
-def process(
-    tsdf_vol,
-    qual_vol,
-    rot_vol,
-    width_vol,
-    gaussian_filter_sigma=1.0,
-    min_width=1.33,
-    max_width=9.33,
+def select_local_maxima(
+    voxel_size,
+    out,
+    threshold=0.9,
+    max_filter_size=3.0,
 ):
-    tsdf_vol = tsdf_vol.squeeze()
-
-    # smooth quality volume with a Gaussian
-    qual_vol = ndimage.gaussian_filter(
-        qual_vol, sigma=gaussian_filter_sigma, mode="nearest"
-    )
-
-    # mask out voxels too far away from the surface
-    outside_voxels = tsdf_vol > 0.5
-    inside_voxels = np.logical_and(1e-3 < tsdf_vol, tsdf_vol < 0.5)
-    valid_voxels = ndimage.morphology.binary_dilation(
-        outside_voxels, iterations=2, mask=np.logical_not(inside_voxels)
-    )
-    qual_vol[valid_voxels == False] = 0.0
-
-    # reject voxels with predicted widths that are too small or too large
-    qual_vol[np.logical_or(width_vol < min_width, width_vol > max_width)] = 0.0
-
-    return qual_vol, rot_vol, width_vol
-
-
-def select(qual_vol, rot_vol, width_vol, threshold=0.90, max_filter_size=4):
-    # threshold on grasp quality
-    qual_vol[qual_vol < threshold] = 0.0
-
-    # non maximum suppression
-    max_vol = ndimage.maximum_filter(qual_vol, size=max_filter_size)
-    qual_vol = np.where(qual_vol == max_vol, qual_vol, 0.0)
-    mask = np.where(qual_vol, 1.0, 0.0)
-
-    # construct grasps
-    grasps, scores = [], []
-    for index in np.argwhere(mask):
-        grasp, score = select_index(qual_vol, rot_vol, width_vol, index)
+    max = ndimage.maximum_filter(out.qual, size=max_filter_size)
+    index_list = np.argwhere(np.logical_and(out.qual == max, out.qual > threshold))
+    grasps, qualities = [], []
+    for index in index_list:
+        grasp, quality = select_at(out, index)
         grasps.append(grasp)
-        scores.append(score)
+        qualities.append(quality)
+    grasps = np.array([from_voxel_coordinates(voxel_size, g) for g in grasps])
+    qualities = np.asarray(qualities)
+    return grasps, qualities
 
-    return grasps, scores
+
+def select_grid(voxel_size, out, threshold=0.9, step=2):
+    grasps, qualities = [], []
+    N = out.qual.shape[0]
+    for i in range(0, N, step):
+        for j in range(0, N, step):
+            for k in range(0, N, step):
+                if out.qual[i, j, k] > threshold:
+                    grasp, quality = select_at(out, (i, j, k))
+                    grasps.append(grasp)
+                    qualities.append(quality)
+    grasps = np.asarray([from_voxel_coordinates(voxel_size, g) for g in grasps])
+    qualities = np.asarray(qualities)
+    return grasps, qualities
 
 
-def select_index(qual_vol, rot_vol, width_vol, index):
+def select_at(out, index):
     i, j, k = index
-    score = qual_vol[i, j, k]
-    ori = Rotation.from_quat(rot_vol[:, i, j, k])
+    ori = Rotation.from_quat(out.rot[:, i, j, k])
     pos = np.array([i, j, k], dtype=np.float64)
-    width = width_vol[i, j, k]
-    return Grasp(Transform(ori, pos), width), score
+    width = out.width[i, j, k]
+    quality = out.qual[i, j, k]
+    return ParallelJawGrasp(Transform(ori, pos), width), quality
+
+
+def to_voxel_coordinates(voxel_size, grasp):
+    pose = grasp.pose
+    pose.translation /= voxel_size
+    width = grasp.width / voxel_size
+    return ParallelJawGrasp(pose, width)
+
+
+def from_voxel_coordinates(voxel_size, grasp):
+    pose = grasp.pose
+    pose.translation *= voxel_size
+    width = grasp.width * voxel_size
+    return ParallelJawGrasp(pose, width)
